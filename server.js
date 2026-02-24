@@ -46,6 +46,8 @@ function resetRoom(room) {
   room.usedWords   = new Set();
   room.status      = 'lobby';
   room.ending      = false;
+  // Reset scores — nouvelle partie propre
+  room.players.forEach(p => { p.totalPoints = 0; });
 }
 
 const rooms = {};
@@ -98,6 +100,7 @@ function startLobby(roomId) {
 function startRound(roomId) {
   const room = rooms[roomId];
   if (!room || room.players.length < MIN_PLAYERS) return;
+  if (room.roundTimer) return; // guard anti double lancement
 
   room.round++;
   room.submissions = [];
@@ -196,6 +199,8 @@ function leaveRoom(roomId, playerId) {
     } else {
       // Moins de MIN_PLAYERS → stopper le round, attendre
       clearRoomTimers(room);
+      room.roundTimer  = null; // blindage explicite
+      room.joinTimer   = null;
       room.submissions = [];
       room.ending      = false;
       room.status      = 'waiting';
@@ -244,9 +249,10 @@ wss.on('connection', (ws) => {
 
       // Informer ce joueur du statut actuel
       if (room.status === 'playing') {
-        // Partie en cours — le joueur rejoignant voit l'écran d'attente
-        // Il recevra roundStart au prochain round
-        send(ws, { type: 'waitingForPlayers' });
+        // MVP : pas de rejoindre en cours de partie — rediriger côté client
+        send(ws, { type: 'gameInProgress' });
+        ws.close();
+        return;
       } else if (room.status === 'waiting') {
         // En attente d'un deuxième joueur
         if (room.players.length >= MIN_PLAYERS) {
