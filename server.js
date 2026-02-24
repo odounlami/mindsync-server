@@ -155,11 +155,9 @@ wss.on('connection', (ws) => {
   function startJoinTimer(roomId) {
     const room = rooms[roomId];
     if (!room) return;
-    // Toujours clear avant de (re)démarrer — évite les intervals en double
-    if (room.joinTimer) {
-      clearInterval(room.joinTimer);
-      room.joinTimer = null;
-    }
+    // Si un timer tourne déjà, ne pas le redémarrer — le countdown continue
+    // Un second joueur qui rejoint ne remet pas le compteur à zéro
+    if (room.joinTimer) return;
 
     let timeLeft = JOIN_TIME / 1000;
 
@@ -172,7 +170,7 @@ wss.on('connection', (ws) => {
         if (room.players.length >= MIN_PLAYERS) {
           startRound(roomId);
         } else {
-          startJoinTimer(roomId); // pas assez de joueurs, on relance
+          startJoinTimer(roomId); // pas assez — nouveau countdown
         }
         return;
       }
