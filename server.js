@@ -93,8 +93,10 @@ wss.on('connection', (ws) => {
         });
       }
 
-      // Tout le monde a soumis → fin de round immédiate
-      if (room.submissions.length === room.players.length) {
+      // Fin de round anticipée UNIQUEMENT si tous les joueurs ont soumis un vrai mot
+      // Les mots vides (timeout) ne déclenchent pas la fin — on attend le setTimeout serveur
+      const realSubmissions = room.submissions.filter(s => s.word !== '');
+      if (realSubmissions.length === room.players.length) {
         endRound(currentRoomId);
       }
     }
@@ -182,6 +184,7 @@ wss.on('connection', (ws) => {
 
     room.round      += 1;
     room.submissions = [];
+    room.ending      = false; // reset guard
 
     // Piocher un mot non encore utilisé dans cette partie
     const available = WORDS.filter(w => !room.usedWords.has(w));
@@ -203,6 +206,9 @@ wss.on('connection', (ws) => {
   function endRound(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+    // Guard contre double appel (setTimeout serveur + soumissions complètes simultanés)
+    if (room.ending) return;
+    room.ending = true;
 
     clearTimeout(roundTimer);
     roundTimer = null;
