@@ -1,7 +1,7 @@
 const WebSocket = require('ws');
 const { randomInt } = require('crypto');
 
-const PORT = process.env.PORT || 8080;
+const PORT        = 8080;
 const MAX_PLAYERS = 4;
 const MIN_PLAYERS = 2;
 const MAX_ROUNDS  = 5;
@@ -41,6 +41,7 @@ wss.on('connection', (ws) => {
           currentWord: null,
           joinTimer:   null,
           paused:      false, // vrai si on attend un joueur de remplacement
+          usedWords:   new Set(), // mots déjà tirés — ne reviennent pas
         };
       }
 
@@ -181,7 +182,12 @@ wss.on('connection', (ws) => {
 
     room.round      += 1;
     room.submissions = [];
-    room.currentWord = WORDS[randomInt(WORDS.length)];
+
+    // Piocher un mot non encore utilisé dans cette partie
+    const available = WORDS.filter(w => !room.usedWords.has(w));
+    const pool = available.length > 0 ? available : WORDS; // fallback si tous utilisés
+    room.currentWord = pool[randomInt(pool.length)];
+    room.usedWords.add(room.currentWord);
 
     broadcastAll(roomId, {
       type:        'roundStart',
@@ -201,7 +207,7 @@ wss.on('connection', (ws) => {
     clearTimeout(roundTimer);
     roundTimer = null;
 
-    // Comptage — ignorer les mots vides (joueur n'a rien soumis)
+    // Comptage des mots non vides (insensible à la casse — déjà lowercased côté client)
     const counts = {};
     room.submissions.forEach(s => {
       if (s.word !== '') {
@@ -213,9 +219,9 @@ wss.on('connection', (ws) => {
       const submission = room.submissions.find(s => s.playerId === p.id);
       let points = 0;
 
-      // 0 pt si rien soumis OU mot vide
+      // 4 pts si synchro (au moins un autre joueur a le même mot), sinon 0
       if (submission && submission.word !== '') {
-        points = counts[submission.word] >= 2 ? 4 : 2;
+        points = counts[submission.word] >= 2 ? 4 : 0;
       }
 
       p.totalPoints += points;
