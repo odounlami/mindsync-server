@@ -21,9 +21,10 @@ const wss = new WebSocket.Server({ port: PORT });
 console.log(`WebSocket server running on ws://localhost:${PORT}`);
 
 wss.on('connection', (ws) => {
-  let currentRoomId  = null;
+  let currentRoomId   = null;
   let currentPlayerId = null;
-  let roundTimer     = null;
+  // roundTimer est maintenant stocké dans room.roundTimer
+  // pour être partagé entre toutes les connexions de la même room
 
   ws.on('message', (msg) => {
     const data = JSON.parse(msg.toString());
@@ -40,8 +41,10 @@ wss.on('connection', (ws) => {
           round:       0,
           currentWord: null,
           joinTimer:   null,
-          paused:      false, // vrai si on attend un joueur de remplacement
-          usedWords:   new Set(), // mots déjà tirés — ne reviennent pas
+          roundTimer:  null,  // ← partagé entre tous les joueurs de la room
+          paused:      false,
+          ending:      false,
+          usedWords:   new Set(),
         };
       }
 
@@ -69,7 +72,6 @@ wss.on('connection', (ws) => {
         if (room.players.length >= MIN_PLAYERS) {
           room.paused = false;
           broadcastAll(currentRoomId, { type: 'gameResumed' });
-          // Relancer le round en cours (nouveau round depuis le suivant)
           setTimeout(() => startRound(currentRoomId), 3000);
         } else {
           // Toujours pas assez, informer le nouveau joueur qu'on attend
@@ -123,30 +125,26 @@ wss.on('connection', (ws) => {
     const gameStarted = room.round > 0;
 
     if (room.players.length < MIN_PLAYERS) {
-      // Stopper le timer de round en cours
-      clearTimeout(roundTimer);
-      roundTimer = null;
+      // Stopper tous les timers actifs de la room
+      clearTimeout(room.roundTimer);
+      room.roundTimer = null;
+      clearInterval(room.joinTimer);
+      room.joinTimer = null;
 
       if (!gameStarted) {
-        // Partie pas encore commencée → reset du timer de lobby
-        clearInterval(room.joinTimer);
-        room.joinTimer = null;
         room.submissions = [];
-
         if (room.players.length === 0) {
-          delete rooms[roomId]; // salle vide, on nettoie
+          delete rooms[roomId];
         } else {
-          // Relancer le countdown lobby pour attendre un autre joueur
           startJoinTimer(roomId);
         }
       } else {
-        // Partie en cours → suspendre et attendre un remplaçant
         room.paused      = true;
         room.submissions = [];
         if (room.players.length > 0) {
           broadcastAll(roomId, { type: 'waitingForPlayers' });
         } else {
-          delete rooms[roomId]; // plus personne, on nettoie
+          delete rooms[roomId];
         }
       }
     }
@@ -156,7 +154,12 @@ wss.on('connection', (ws) => {
   // ── startJoinTimer ──────────────────────────────────────────────────────────
   function startJoinTimer(roomId) {
     const room = rooms[roomId];
-    if (!room || room.joinTimer) return; // déjà en cours
+    if (!room) return;
+    // Toujours clear avant de (re)démarrer — évite les intervals en double
+    if (room.joinTimer) {
+      clearInterval(room.joinTimer);
+      room.joinTimer = null;
+    }
 
     let timeLeft = JOIN_TIME / 1000;
 
@@ -166,12 +169,12 @@ wss.on('connection', (ws) => {
       if (timeLeft <= 0) {
         clearInterval(room.joinTimer);
         room.joinTimer = null;
-
-        if (room.players.length < MIN_PLAYERS) {
-          startJoinTimer(roomId); // reset si pas assez de joueurs
-        } else {
+        if (room.players.length >= MIN_PLAYERS) {
           startRound(roomId);
+        } else {
+          startJoinTimer(roomId); // pas assez de joueurs, on relance
         }
+        return;
       }
       timeLeft--;
     }, 1000);
@@ -199,7 +202,8 @@ wss.on('connection', (ws) => {
       currentWord: room.currentWord,
     });
 
-    roundTimer = setTimeout(() => endRound(roomId), ROUND_TIME);
+    // Timer stocké dans la room — partagé entre tous les joueurs
+    room.roundTimer = setTimeout(() => endRound(roomId), ROUND_TIME);
   }
 
   // ── endRound ────────────────────────────────────────────────────────────────
@@ -210,8 +214,8 @@ wss.on('connection', (ws) => {
     if (room.ending) return;
     room.ending = true;
 
-    clearTimeout(roundTimer);
-    roundTimer = null;
+    clearTimeout(room.roundTimer);
+    room.roundTimer = null;
 
     // Comptage des mots non vides (insensible à la casse — déjà lowercased côté client)
     const counts = {};
