@@ -5,262 +5,282 @@ const PORT        = 8080;
 const MAX_PLAYERS = 4;
 const MIN_PLAYERS = 2;
 const MAX_ROUNDS  = 5;
-const JOIN_TIME   = 30_000; // 30s pour rejoindre
-const ROUND_TIME  = 15_000; // 15s par round
+const JOIN_TIME   = 30; // secondes
+const ROUND_TIME  = 15_000; // ms
 
 const WORDS = [
   'chien','chat','maison','voiture','arbre',
   'soleil','lune','ordinateur','musique','livre',
   'ville','plage','montagne','école',
-  'amour','amitié','rêve','mer','forêt','cinéma'
+  'amour','amitié','rêve','mer','forêt','cinéma',
+  'feu','eau','vent','terre','nuit','jour',
 ];
 
+// ── Créer une room fraîche ────────────────────────────────────────────────────
+function createRoom() {
+  return {
+    players:    [],  // { id, name, totalPoints, ws }
+    round:      0,
+    submissions:[],
+    currentWord:null,
+    usedWords:  new Set(),
+    joinTimer:  null,
+    roundTimer: null,
+    status:     'lobby',  // 'lobby' | 'playing' | 'waiting'
+    ending:     false,
+  };
+}
+
+// ── Nettoyer tous les timers d'une room ───────────────────────────────────────
+function clearRoomTimers(room) {
+  if (room.joinTimer)  { clearInterval(room.joinTimer);  room.joinTimer  = null; }
+  if (room.roundTimer) { clearTimeout(room.roundTimer);  room.roundTimer = null; }
+}
+
+// ── Réinitialiser une room pour une nouvelle partie (garder les joueurs) ──────
+function resetRoom(room) {
+  clearRoomTimers(room);
+  room.round       = 0;
+  room.submissions = [];
+  room.currentWord = null;
+  room.usedWords   = new Set();
+  room.status      = 'lobby';
+  room.ending      = false;
+}
+
 const rooms = {};
-
 const wss = new WebSocket.Server({ port: PORT });
-console.log(`WebSocket server running on ws://localhost:${PORT}`);
+console.log(`WS server on ws://localhost:${PORT}`);
 
-wss.on('connection', (ws) => {
-  let currentRoomId   = null;
-  let currentPlayerId = null;
-  // roundTimer est maintenant stocké dans room.roundTimer
-  // pour être partagé entre toutes les connexions de la même room
+// ── Helpers broadcast ─────────────────────────────────────────────────────────
+function send(ws, payload) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+}
 
-  ws.on('message', (msg) => {
-    const data = JSON.parse(msg.toString());
+function broadcast(room, payload) {
+  const msg = JSON.stringify(payload);
+  room.players.forEach(p => {
+    if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
+  });
+}
 
-    // ── JOIN ──────────────────────────────────────────────────────────────────
-    if (data.type === 'join') {
-      currentRoomId   = data.roomId;
-      currentPlayerId = data.playerId;
+function broadcastPlayers(room) {
+  broadcast(room, {
+    type: 'players',
+    players: room.players.map(p => ({ id: p.id, name: p.name })),
+  });
+}
 
-      if (!rooms[currentRoomId]) {
-        rooms[currentRoomId] = {
-          players:     [],
-          submissions: [],
-          round:       0,
-          currentWord: null,
-          joinTimer:   null,
-          roundTimer:  null,  // ← partagé entre tous les joueurs de la room
-          paused:      false,
-          ending:      false,
-          usedWords:   new Set(),
-        };
+// ── Lobby : countdown avant de lancer la partie ───────────────────────────────
+function startLobby(roomId) {
+  const room = rooms[roomId];
+  if (!room || room.joinTimer) return; // déjà en cours
+
+  let t = JOIN_TIME;
+  room.joinTimer = setInterval(() => {
+    if (!rooms[roomId]) { clearInterval(room.joinTimer); return; }
+    broadcast(room, { type: 'joinCountdown', timeLeft: t });
+    if (t <= 0) {
+      clearInterval(room.joinTimer);
+      room.joinTimer = null;
+      if (room.players.length >= MIN_PLAYERS) {
+        startRound(roomId);
+      } else {
+        startLobby(roomId); // relancer si pas assez
       }
+      return;
+    }
+    t--;
+  }, 1000);
+}
 
-      const room = rooms[currentRoomId];
+// ── Round ─────────────────────────────────────────────────────────────────────
+function startRound(roomId) {
+  const room = rooms[roomId];
+  if (!room || room.players.length < MIN_PLAYERS) return;
+
+  room.round++;
+  room.submissions = [];
+  room.ending      = false;
+  room.status      = 'playing';
+
+  const available = WORDS.filter(w => !room.usedWords.has(w));
+  const pool = available.length > 0 ? available : WORDS;
+  room.currentWord = pool[randomInt(pool.length)];
+  room.usedWords.add(room.currentWord);
+
+  broadcast(room, {
+    type: 'roundStart',
+    round: room.round,
+    currentWord: room.currentWord,
+  });
+
+  room.roundTimer = setTimeout(() => endRound(roomId), ROUND_TIME);
+}
+
+function endRound(roomId) {
+  const room = rooms[roomId];
+  if (!room || room.ending) return;
+  room.ending = true;
+
+  clearTimeout(room.roundTimer);
+  room.roundTimer = null;
+
+  // Comptage
+  const counts = {};
+  room.submissions.forEach(s => {
+    if (s.word) counts[s.word] = (counts[s.word] || 0) + 1;
+  });
+
+  const results = room.players.map(p => {
+    const sub = room.submissions.find(s => s.playerId === p.id);
+    let points = 0;
+    if (sub && sub.word && counts[sub.word] >= 2) points = 4;
+    p.totalPoints += points;
+    return { playerId: p.id, word: sub ? sub.word : '', points };
+  });
+
+  broadcast(room, { type: 'roundResult', results });
+
+  const gameOver = room.round >= MAX_ROUNDS;
+  if (gameOver) {
+    const finalScores = room.players.map(p => ({ id: p.id, name: p.name, totalPoints: p.totalPoints }));
+    broadcast(room, { type: 'gameOver', finalScores });
+    // Ne pas delete la room — réinitialiser pour permettre une nouvelle partie
+    resetRoom(room);
+    broadcastPlayers(room);
+    // Relancer le lobby pour les joueurs encore connectés
+    if (room.players.length >= 1) {
+      broadcast(room, { type: 'lobbyRestart' }); // signal client : nouvelle partie
+      if (room.players.length >= MIN_PLAYERS) {
+        startLobby(roomId);
+      }
+      // sinon les joueurs attendent que d'autres rejoignent
+    }
+  } else {
+    setTimeout(() => startRound(roomId), 3000);
+  }
+}
+
+// ── Gestion départ joueur ─────────────────────────────────────────────────────
+function leaveRoom(roomId, playerId) {
+  if (!roomId || !playerId) return;
+  const room = rooms[roomId];
+  if (!room) return;
+
+  room.players = room.players.filter(p => p.id !== playerId);
+  broadcastPlayers(room);
+
+  // Salle vide → supprimer
+  if (room.players.length === 0) {
+    clearRoomTimers(room);
+    delete rooms[roomId];
+    return;
+  }
+
+  const enough = room.players.length >= MIN_PLAYERS;
+
+  if (room.status === 'lobby') {
+    if (!enough) {
+      // Plus assez en lobby : stopper le countdown, attendre
+      clearRoomTimers(room);
+      broadcast(room, { type: 'waitingForPlayers' });
+      room.status = 'waiting';
+    }
+    // Si encore assez → le countdown continue naturellement
+  }
+
+  if (room.status === 'playing') {
+    if (enough) {
+      // Partie continue — ne rien faire, le round en cours se termine normalement
+    } else {
+      // Moins de MIN_PLAYERS → stopper le round, attendre
+      clearRoomTimers(room);
+      room.submissions = [];
+      room.ending      = false;
+      room.status      = 'waiting';
+      broadcast(room, { type: 'waitingForPlayers' });
+    }
+  }
+
+  if (room.status === 'waiting') {
+    // Déjà en attente, rien de plus à faire
+  }
+}
+
+// ── Connexion WebSocket ───────────────────────────────────────────────────────
+wss.on('connection', (ws) => {
+  let roomId   = null;
+  let playerId = null;
+
+  ws.on('message', (raw) => {
+    let data;
+    try { data = JSON.parse(raw.toString()); } catch { return; }
+
+    // ── JOIN ────────────────────────────────────────────────────────────────
+    if (data.type === 'join') {
+      roomId   = data.roomId;
+      playerId = data.playerId;
+
+      if (!rooms[roomId]) rooms[roomId] = createRoom();
+      const room = rooms[roomId];
 
       if (room.players.length >= MAX_PLAYERS) {
-        ws.send(JSON.stringify({ type: 'roomFull' }));
+        send(ws, { type: 'roomFull' });
         ws.close();
         return;
       }
 
-      // Évite les doublons (reconnexion)
-      if (!room.players.find(p => p.id === currentPlayerId)) {
-        room.players.push({ id: currentPlayerId, name: data.name, totalPoints: 0, ws });
+      // Reconnexion ou nouveau joueur
+      const existing = room.players.find(p => p.id === playerId);
+      if (existing) {
+        existing.ws   = ws;
+        existing.name = data.name;
       } else {
-        // Reconnexion : mettre à jour la socket
-        const existing = room.players.find(p => p.id === currentPlayerId);
-        if (existing) existing.ws = ws;
+        room.players.push({ id: playerId, name: data.name, totalPoints: 0, ws });
       }
 
-      broadcastPlayers(currentRoomId);
+      broadcastPlayers(room);
 
-      if (room.paused) {
-        // La partie était suspendue — assez de joueurs pour reprendre
+      // Informer ce joueur du statut actuel
+      if (room.status === 'playing') {
+        // Partie en cours — le joueur rejoignant voit l'écran d'attente
+        // Il recevra roundStart au prochain round
+        send(ws, { type: 'waitingForPlayers' });
+      } else if (room.status === 'waiting') {
+        // En attente d'un deuxième joueur
         if (room.players.length >= MIN_PLAYERS) {
-          room.paused = false;
-          broadcastAll(currentRoomId, { type: 'gameResumed' });
-          setTimeout(() => startRound(currentRoomId), 3000);
+          // Assez de joueurs — lancer une nouvelle partie
+          room.status = 'lobby';
+          broadcast(room, { type: 'newPartyReady' });
+          startLobby(roomId);
         } else {
-          // Toujours pas assez, informer le nouveau joueur qu'on attend
-          ws.send(JSON.stringify({ type: 'waitingForPlayers' }));
+          send(ws, { type: 'waitingForPlayers' });
         }
       } else {
-        startJoinTimer(currentRoomId);
+        // Lobby normal
+        startLobby(roomId);
       }
     }
 
-    // ── WORD ──────────────────────────────────────────────────────────────────
+    // ── WORD ────────────────────────────────────────────────────────────────
     if (data.type === 'word') {
-      const room = rooms[currentRoomId];
-      if (!room || room.paused) return;
+      const room = rooms[roomId];
+      if (!room || room.status !== 'playing') return;
+      if (room.submissions.find(s => s.playerId === playerId)) return; // déjà soumis
 
-      // Un seul envoi par joueur par round
-      if (!room.submissions.find(s => s.playerId === currentPlayerId)) {
-        room.submissions.push({
-          playerId: currentPlayerId,
-          word: data.word.trim().toLowerCase(),
-        });
-      }
+      room.submissions.push({ playerId, word: data.word.trim().toLowerCase() });
 
-      // Fin de round anticipée UNIQUEMENT si tous les joueurs ont soumis un vrai mot
-      // Les mots vides (timeout) ne déclenchent pas la fin — on attend le setTimeout serveur
-      const realSubmissions = room.submissions.filter(s => s.word !== '');
-      if (realSubmissions.length === room.players.length) {
-        endRound(currentRoomId);
-      }
+      const realSubs = room.submissions.filter(s => s.word !== '');
+      if (realSubs.length === room.players.length) endRound(roomId);
     }
 
-    // ── LEAVE ─────────────────────────────────────────────────────────────────
+    // ── LEAVE ───────────────────────────────────────────────────────────────
     if (data.type === 'leave') {
-      leaveRoom(currentRoomId, currentPlayerId);
+      leaveRoom(roomId, playerId);
+      roomId = playerId = null;
     }
   });
 
-  ws.on('close', () => {
-    leaveRoom(currentRoomId, currentPlayerId);
-  });
-
-  // ── leaveRoom ───────────────────────────────────────────────────────────────
-  function leaveRoom(roomId, playerId) {
-    if (!roomId || !playerId) return;
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.players = room.players.filter(p => p.id !== playerId);
-    broadcastPlayers(roomId);
-
-    const gameStarted = room.round > 0;
-
-    if (room.players.length < MIN_PLAYERS) {
-      // Stopper tous les timers actifs de la room
-      clearTimeout(room.roundTimer);
-      room.roundTimer = null;
-      clearInterval(room.joinTimer);
-      room.joinTimer = null;
-
-      if (!gameStarted) {
-        room.submissions = [];
-        if (room.players.length === 0) {
-          delete rooms[roomId];
-        } else {
-          startJoinTimer(roomId);
-        }
-      } else {
-        room.paused      = true;
-        room.submissions = [];
-        if (room.players.length > 0) {
-          broadcastAll(roomId, { type: 'waitingForPlayers' });
-        } else {
-          delete rooms[roomId];
-        }
-      }
-    }
-    // Si room.players.length >= MIN_PLAYERS la partie continue normalement
-  }
-
-  // ── startJoinTimer ──────────────────────────────────────────────────────────
-  function startJoinTimer(roomId) {
-    const room = rooms[roomId];
-    if (!room) return;
-    // Si un timer tourne déjà, ne pas le redémarrer — le countdown continue
-    // Un second joueur qui rejoint ne remet pas le compteur à zéro
-    if (room.joinTimer) return;
-
-    let timeLeft = JOIN_TIME / 1000;
-
-    room.joinTimer = setInterval(() => {
-      broadcastAll(roomId, { type: 'joinCountdown', timeLeft });
-
-      if (timeLeft <= 0) {
-        clearInterval(room.joinTimer);
-        room.joinTimer = null;
-        if (room.players.length >= MIN_PLAYERS) {
-          startRound(roomId);
-        } else {
-          startJoinTimer(roomId); // pas assez — nouveau countdown
-        }
-        return;
-      }
-      timeLeft--;
-    }, 1000);
-  }
-
-  // ── startRound ──────────────────────────────────────────────────────────────
-  function startRound(roomId) {
-    const room = rooms[roomId];
-    if (!room || room.players.length < MIN_PLAYERS) return;
-
-    room.round      += 1;
-    room.submissions = [];
-    room.ending      = false; // reset guard
-
-    // Piocher un mot non encore utilisé dans cette partie
-    const available = WORDS.filter(w => !room.usedWords.has(w));
-    const pool = available.length > 0 ? available : WORDS; // fallback si tous utilisés
-    room.currentWord = pool[randomInt(pool.length)];
-    room.usedWords.add(room.currentWord);
-
-    broadcastAll(roomId, {
-      type:        'roundStart',
-      round:       room.round,
-      roundTime:   ROUND_TIME,
-      currentWord: room.currentWord,
-    });
-
-    // Timer stocké dans la room — partagé entre tous les joueurs
-    room.roundTimer = setTimeout(() => endRound(roomId), ROUND_TIME);
-  }
-
-  // ── endRound ────────────────────────────────────────────────────────────────
-  function endRound(roomId) {
-    const room = rooms[roomId];
-    if (!room) return;
-    // Guard contre double appel (setTimeout serveur + soumissions complètes simultanés)
-    if (room.ending) return;
-    room.ending = true;
-
-    clearTimeout(room.roundTimer);
-    room.roundTimer = null;
-
-    // Comptage des mots non vides (insensible à la casse — déjà lowercased côté client)
-    const counts = {};
-    room.submissions.forEach(s => {
-      if (s.word !== '') {
-        counts[s.word] = (counts[s.word] || 0) + 1;
-      }
-    });
-
-    const results = room.players.map(p => {
-      const submission = room.submissions.find(s => s.playerId === p.id);
-      let points = 0;
-
-      // 4 pts si synchro (au moins un autre joueur a le même mot), sinon 0
-      if (submission && submission.word !== '') {
-        points = counts[submission.word] >= 2 ? 4 : 0;
-      }
-
-      p.totalPoints += points;
-      return { playerId: p.id, word: submission ? submission.word : '', points };
-    });
-
-    broadcastAll(roomId, { type: 'roundResult', results });
-
-    if (room.round >= MAX_ROUNDS || room.players.length < MIN_PLAYERS) {
-      const finalScores = room.players.map(p => ({ name: p.name, totalPoints: p.totalPoints }));
-      broadcastAll(roomId, { type: 'gameOver', finalScores });
-      delete rooms[roomId];
-    } else {
-      setTimeout(() => startRound(roomId), 3000);
-    }
-  }
-
-  // ── Helpers ──────────────────────────────────────────────────────────────────
-  function broadcastPlayers(roomId) {
-    const room = rooms[roomId];
-    if (!room) return;
-    const payload = { type: 'players', players: room.players.map(p => ({ id: p.id, name: p.name })) };
-    broadcastAll(roomId, payload);
-  }
-
-  function broadcastAll(roomId, payload) {
-    const room = rooms[roomId];
-    if (!room) return;
-    const msg = JSON.stringify(payload);
-    room.players.forEach(p => {
-      if (p.ws.readyState === WebSocket.OPEN) p.ws.send(msg);
-    });
-  }
+  ws.on('close', () => leaveRoom(roomId, playerId));
 });
